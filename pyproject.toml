@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsvgrab"
+version = "1.0.0"
+description = "Pobieranie panoram Google Street View wraz z metadanymi, mapami głębi i chmurami punktów 3D"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "StreetViewGrab"}
+]
+keywords = ["streetview", "panorama", "depthmap", "pointcloud", "google-maps", "3d"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+pillow = ["Pillow>=9.0.0"]
+
+[project.scripts]
+gsvgrab = "gsvgrab.cli:main"
