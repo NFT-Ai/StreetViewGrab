@@ -236,4 +236,165 @@ def run_selftest(verbose=True):
 if __name__ == "__main__":
     import sys
 
+def build_fake_response(depth_b64):
+    """Buduje syntetyczną odpowiedź ``photometa`` o strukturze zgodnej z API."""
+    others = [[[2, "NEIGHBOR00000000000001"], None,
+                [[None, None, 52.128, 20.669], [107.0, None, 138.9], [20.0, -1.0, 1.0]]]]
+    message = [None] * 20
+    message[0] = [1]  # kod odpowiedzi: 1 = OK
+    message[1] = [1, "TESTPANOID000000000001"]
+    # msg[2][3] = [lista rozmiarow obrazu, rozmiar kafla]
+    message[2] = [2, 2, [8192, 16384], [[[[256, 512]], [[512, 1024]]], [512, 512]]]
+    message[3] = [3, None, [["13 Piasta", "pl"], ["Milanówek, mazowieckie", "pl"]]]
+    message[4] = [[[[u"\u00a9 2026 Google"]]], [["Google", None, "//icon"]]]
+    # msg[5][0] to tablica pol: 1 - geografia, 3 - sasiedzi, 5 - glebia, 6 - polaczenia,
+    # 8 - daty historyczne, 12 - etykiety ulic
+    message[5] = [[
+        [0, 0, 0],
+        [[None, None, 52.1279153, 20.6692050], [106.75], [26.0, 89.0, 2.0], None, "PL"],
+        None,
+        [others],
+        None,
+        [None, [None, None, depth_b64]],
+        [[0, [0, 0, 0, 180.0]]],
+        None,
+        [[0, [2015, 6]]],
+        None, None, None,
+        [[[[0, 0, ["Piasta", "pl"]]], [24.57, 204.34]]],
+    ]]
+    message[6] = [None, None, None, None, None, [None, None, "launch"], None, [2025, 10]]
+    message[7] = ["//www.google.com/local/imagery/report/?cb_client=maps_sv.tactile"]
+    return [None, [message]]
+
+
+def test_parser(checker):
+    """Parser metadanych na syntetycznej odpowiedzi."""
+    payload = build_depth_payload(width=16, height=8)
+    depth_b64 = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    pano = panorama_by_id_response(build_fake_response(depth_b64), include_depth=True)
+    checker.check("parser: panoid", pano.get("panoid") == "TESTPANOID000000000001",
+                  str(pano.get("panoid")))
+    checker.close(pano.get("lat") or 0.0, 52.1279153, "parser: szerokosc", tolerance=1e-7)
+    checker.close(pano.get("heading_deg") or 0.0, 26.0, "parser: naglowek", tolerance=1e-6)
+    checker.close(pano.get("pitch_deg") or 0.0, 1.0, "parser: pochylenie", tolerance=1e-6)
+    checker.check("parser: adres", pano["address"][0]["text"] == "13 Piasta",
+                  str(pano.get("address")))
+    checker.check("parser: copyright", pano["copyright"].endswith("Google"),
+                  str(pano.get("copyright")))
+    checker.check("parser: data zdjecia",
+                  pano["capture_date"] == {"year": 2025, "month": 10, "day": None},
+                  str(pano.get("capture_date")))
+    checker.check("parser: rozmiary obrazu", pano["image_sizes"][1] == {"x": 1024, "y": 512},
+                  str(pano.get("image_sizes")))
+    checker.check("parser: rozmiar kafla", pano["tile_size"] == {"x": 512, "y": 512},
+                  str(pano.get("tile_size")))
+    checker.check("parser: etykieta ulicy", pano["street_labels"][0]["name"] == "Piasta",
+                  str(pano.get("street_labels")))
+    checker.check("parser: historia zdjec",
+                  pano["historical_captures"][0]["capture_date"] == {"year": 2015, "month": 6},
+                  str(pano.get("historical_captures")))
+    checker.check("parser: sasiedzi i historia",
+                  len(pano["neighbors"]) + len(pano["historical_captures"]) == 1,
+                  str(len(pano["neighbors"])))
+    checker.check("parser: mapa glebi zdekodowana", pano["_depth"].width == 16,
+                  str(pano.get("_depth")))
+    checker.check("try_get zwraca wartosc domyslna",
+                  try_get(lambda: [][5], "domyslna") == "domyslna")
+
+
+def build_depth_flat_horizontal(width=8, height=4, distance=5.0):
+    """Mapa glebi: plaszczyzna pozioma 5 m pod kamera (n = (0,0,1), d = -5).
+
+    Plaszczyzna pozioma jest widoczna z wszystkich kierunkow, wiec wszystkie
+    piksele otrzymuja poprawna glebie. Indeksy plaszczyzn sa 1-based.
+    """
+    header = struct.pack("<BHHHH", 9, 2, width, height, 9)
+    indices = bytes([1] * (width * height))
+    planes = (struct.pack("<4f", 0.0, 0.0, 0.0, 0.0)
+              + struct.pack("<4f", 0.0, 0.0, 1.0, -float(distance)))
+    return header + indices + planes
+
+
+def test_crawl_and_enu(checker):
+    """Przechodzenie ulica (katy) i przejscie do ukladu ENU."""
+    from .crawl import _angle_difference, _axis_difference
+    from .pointcloud import (curvature_drop, depth_to_enu_points, local_offset,
+                             merge_panoramas)
+
+    checker.close(_angle_difference(0, 0), 0.0, "kat: 0 vs 0", tolerance=1e-9)
+    checker.close(_angle_difference(350, 10), 20.0, "kat: 350 vs 10 (przez 0)", tolerance=1e-9)
+    checker.close(_angle_difference(0, 180), 180.0, "kat: 0 vs 180", tolerance=1e-9)
+    checker.close(_axis_difference(25, 205), 0.0, "kat modulo 180: 25 vs 205", tolerance=1e-9)
+    checker.close(_axis_difference(0, 90), 90.0, "kat modulo 180: 0 vs 90", tolerance=1e-9)
+
+    east, north = local_offset(52.1279153, 20.6692050, 52.1280000, 20.6693000)
+    checker.check("przesuniecie lokalne zgodne z haversine",
+                  abs((east ** 2 + north ** 2) ** 0.5
+                      - distance_m(52.1279153, 20.6692050, 52.1280000, 20.6693000)) < 1e-6,
+                  "%.6f / %.6f" % (east, north))
+    checker.check("przesuniecie na polnoc dodatnie", north > 0, "%.4f" % north)
+    checker.check("spadek horyzontu na 100 m ~ 0.8 mm",
+                  abs(curvature_drop(100.0) - 0.0008) < 0.0002, "%.6f" % curvature_drop(100.0))
+
+    payload = build_depth_flat_horizontal(width=16, height=8, distance=5.0)
+    depth = parse_depth(base64.urlsafe_b64encode(payload).decode("ascii").rstrip("="))
+    points = depth_to_enu_points(depth, heading_deg=0.0)
+    checker.check("ENU: plaszczyzna pozioma 5 m pod kamera",
+                  all(abs(abs(p[2]) - 5.0) < 1e-6 for p in points), str(points[0]))
+    checker.check("ENU: 128 punktow dla mapy 16x8", len(points) == 128, str(len(points)))
+    checker.check("ENU: wiersz 0 obrazu (zenit) ma Z > 0",
+                  all(p[2] > 0 for p in points if p[5] == 0),
+                  str([p for p in points if p[5] == 0][:1]))
+    checker.check("ENU: ostatni wiersz obrazu (nadir) ma Z < 0",
+                  all(p[2] < 0 for p in points if p[5] == 7),
+                  str([p for p in points if p[5] == 7][:1]))
+    checker.check("ENU: wspolrzedne E zalezne od piksela (kolumna i wiersz)",
+                  len({round(p[0], 3) for p in points}) >= 16,
+                  str(len({round(p[0], 3) for p in points})))
+
+    merged = merge_panoramas([
+        {"depth": depth, "panoid": "A", "lat": 52.0, "lon": 20.0,
+         "elevation_m": 100.0, "heading_deg": 0.0},
+        {"depth": depth, "panoid": "B", "lat": 52.0, "lon": 20.0,
+         "elevation_m": 100.0, "heading_deg": 90.0},
+    ], stride=1)
+    checker.check("scalanie: 2 panoramy, 256 punktow (stride 1)",
+                  merged["panoramas"] == 2 and merged["points"] == 256,
+                  str((merged["panoramas"], merged["points"])))
+    checker.check("scalanie: identyczna lokalizacja = zero przesuniecia",
+                  merged["per_panorama"][1]["distance_m"] == 0.0,
+                  str(merged["per_panorama"][1]))
+    checker.check("scalanie: probkowanie stride=2 redukuje liczbe punktow 4x",
+                  merge_panoramas([
+                      {"depth": depth, "panoid": "A", "lat": 52.0, "lon": 20.0,
+                       "elevation_m": 100.0, "heading_deg": 0.0}], stride=2)["points"] == 32,
+                  "spodziewano 32")
+def run_selftest(verbose=True):
+    """Uruchamia wszystkie testy offline. Zwraca 0 (sukces) lub 1."""
+    import shutil
+
+    checker = Checker(verbose=verbose)
+    print("gsvgrab selftest - testy offline")
+    workdir = tempfile.mkdtemp(prefix="gsvgrab-selftest-")
+    try:
+        print("\n[1] siatka kafli")
+        test_tile_grid(checker)
+        print("[2] kodowanie protobufa")
+        test_protobuf(checker)
+        print("[3] geometria")
+        test_geo(checker)
+        print("[4] dekoder glebi")
+        test_depth_decode(checker)
+        print("[5] PNG")
+        test_png(checker, workdir)
+        print("[6] chmura punktow")
+        test_pointcloud(checker, workdir)
+        print("[7] parser metadanych")
+        test_parser(checker)
+        print("[8] przechodzenie ulicy i uklad ENU")
+        test_crawl_and_enu(checker)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print("\nWynik: %d OK, %d FAIL" % (checker.passed, checker.failed))
+    return 0 if checker.failed == 0 else 1
     sys.exit(run_selftest(verbose=True))

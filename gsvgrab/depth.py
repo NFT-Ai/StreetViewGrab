@@ -263,6 +263,22 @@ def depth_to_float32(depth_map):
     return struct.pack("<%df" % len(depth_map.data), *depth_map.data)
 
 
+def load_depth_f32(path, width, height):
+    """Wczytuje plik ``depth_f32.bin`` zapisany przez :func:`depth_to_float32`."""
+    import os
+
+    if not os.path.exists(path):
+        raise IOError("nie znaleziono pliku glebi: %s" % path)
+    with open(path, "rb") as handle:
+        payload = handle.read()
+    count = width * height
+    if len(payload) < count * 4:
+        raise IOError("plik glebi za krotki: %d B, oczekiwano %d B" % (len(payload), count * 4))
+    values = struct.unpack_from("<%df" % count, payload, 0)
+    return DepthMap(width, height, list(values), header={"width": width, "height": height},
+                    encoding="plik")
+
+
 
 def parse_depth(b64_string):
     """Buduje :class:`DepthMap` z ciągu base64 zwróconego przez ``photometa``."""

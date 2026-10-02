@@ -16,4 +16,4 @@ Przykład::
 """
 
 __version__ = "1.0.0"
-__all__ = ["api", "depth", "geo", "http", "parse", "protobuf_url"]
+__all__ = ["api", "depth", "geo", "http", "mesh", "parse", "protobuf_url"]

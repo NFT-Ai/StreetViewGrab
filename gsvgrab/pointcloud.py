@@ -45,12 +45,11 @@ def depth_to_points(depth_map, stride=1, min_depth=None, max_depth=None, yaw_deg
             # (dekoder zapisuje wartość z promienia ``x`` w kolumnie ``w-1-x``), dlatego
             # dla kolumny ``x`` kierunek liczymy jak dla promienia ``w-1-x``.
             phi = (x + 0.5) / width * 2.0 * math.pi + math.pi / 2.0
-            direction_x = sin_theta * math.cos(phi)
-            direction_y = sin_theta * math.sin(phi)
-            direction_z = cos_theta
-            px = direction_x * depth
-            py = direction_y * depth
-            pz = direction_z * depth
+            px = sin_theta * math.cos(phi) * depth
+            py = sin_theta * math.sin(phi) * depth
+            # Wiersz 0 obrazu to zenit, a składowa cos(theta) z dekodera jest skierowana
+            # w dół - stąd minus, żeby oś Z wskazywała w górę.
+            pz = -cos_theta * depth
             if yaw:
                 rotated_x = px * cos_yaw - py * sin_yaw
                 rotated_y = px * sin_yaw + py * cos_yaw
@@ -127,3 +126,118 @@ def build_pointcloud(depth_map, out_path, stride=1, max_depth=None, min_depth=No
     count = write_ply(out_path, points, colors=colors, comments=comments, binary=binary)
     return {"points": count, "colored": colors is not None, "stride": stride,
             "yaw_deg": yaw_deg, "path": out_path}
+
+
+# ---------------------------------------------------------------------------
+# Uklad ENU (East / North / Up) - potrzebny do sklejania wielu panoram
+# ---------------------------------------------------------------------------
+#: Konwencja (zweryfikowana empirycznie na danych z ul. Piasta w Milanowku):
+#: srodek zdjecia equirectangularnego (x = w/2) odpowiada naglowkowi panoramy
+#: ``heading``; kazde zwiekszenie x o jeden piksel obraca sie o 360/w stopni
+#: w kierunku wschodnim. Dzieki temu chmury z dwoch stron ulicy pokrywaja sie
+#: w ulamkach decymetra (pomiar: 81,7% punktow w promieniu 0,35 m).
+
+
+def _normalize_deg(value):
+    return float(value or 0.0) % 360.0
+
+
+def local_offset(lat0, lon0, lat1, lon1):
+    """Przesuniecie punktu wzgledem punktu odniesienia w metrach (E, N)."""
+    from .geo import bearing_deg, distance_m
+
+    distance = distance_m(lat0, lon0, lat1, lon1)
+    bearing = math.radians(bearing_deg(lat0, lon0, lat1, lon1))
+    return distance * math.sin(bearing), distance * math.cos(bearing)
+
+
+def curvature_drop(distance):
+    """Spadek horyzontu (promien Ziemi 6371008,8 m) - dla dlugich tras maly, ale realny."""
+    return distance * distance / (2.0 * 6371008.8)
+
+
+def depth_to_enu_points(depth_map, heading_deg, east=0.0, north=0.0, up=0.0, stride=1,
+                        max_depth=None, min_depth=None):
+    """Zamienia mapę głębi na punkty w układzie ENL względem kamery.
+
+    Zwraca listę ``(east, north, up, depth_m, px, py)``.
+    """
+    width = depth_map.width
+    height = depth_map.height
+    heading = math.radians(_normalize_deg(heading_deg))
+    points = []
+    for y in range(0, height, stride):
+        theta = (height - y - 0.5) / height * math.pi
+        sin_theta = math.sin(theta)
+        cos_theta = math.cos(theta)
+        row = y * width
+        for x in range(0, width, stride):
+            depth = depth_map.data[row + x]
+            if depth <= 0:
+                continue
+            if min_depth is not None and depth < min_depth:
+                continue
+            if max_depth is not None and depth > max_depth:
+                continue
+            # Mapa glebi jest zapisana z odbiciem lustrzanym (patrz depth.py)
+            phi = (x + 0.5) / width * 2.0 * math.pi + math.pi / 2.0
+            compass = heading + (phi - 1.5 * math.pi)
+            horizontal = depth * sin_theta
+            # Wiersz 0 obrazu to zenit; skladowa cos(theta) z dekodera jest skierowana
+            # w dol, wiec dla osi "w gore" bierzemy ja ze znakiem minus.
+            points.append((east + horizontal * math.sin(compass),
+                           north + horizontal * math.cos(compass),
+                           up - depth * cos_theta,
+                           depth, x, y))
+    return points
+
+
+def merge_panoramas(entries, out_path=None, stride=2, max_depth=None, colors=None,
+                    comments=(), binary=True):
+    """Scala chmury wielu panoram w jeden plik PLY we wspolnym ukladzie ENU.
+
+    ``entries`` - lista slownikow z kluczami: ``depth`` (:class:`DepthMap`),
+    ``heading_deg``, ``lat``, ``lon``, ``elevation_m``, ``panoid``, opcjonalnie
+    ``colors`` (lista RGB dla wlasnych punktow).
+
+    Poczatek ukladu to kamera pierwszej panoramy; wspolrzedne sa w metrach,
+    oś X = wschod, Y = polnoc, Z = w gore.
+    """
+    if not entries:
+        raise ValueError("brak panoram do scalenia")
+    origin = entries[0]
+    lat0 = origin.get("lat")
+    lon0 = origin.get("lon")
+    elev0 = origin.get("elevation_m") or 0.0
+    all_points = []
+    all_colors = []
+    colored = colors is not None
+    per_pano = []
+    for entry in entries:
+        east = north = 0.0
+        up = 0.0
+        if entry is not origin and lat0 is not None:
+            east, north = local_offset(lat0, lon0, entry.get("lat"), entry.get("lon"))
+            up = (entry.get("elevation_m") or elev0) - elev0 - curvature_drop(
+                (east ** 2 + north ** 2) ** 0.5)
+        points = depth_to_enu_points(entry["depth"], entry.get("heading_deg"), east, north, up,
+                                     stride=stride, max_depth=max_depth)
+        all_points.extend(points)
+        entry_colors = entry.get("colors")
+        if colored and entry_colors:
+            all_colors.extend(entry_colors)
+        else:
+            colored = False
+            all_colors = None
+        per_pano.append({"panoid": entry.get("panoid"), "points": len(points),
+                         "east_m": round(east, 3), "north_m": round(north, 3),
+                         "up_m": round(up, 3),
+                         "distance_m": round((east ** 2 + north ** 2) ** 0.5, 2)})
+    result = {"panoramas": len(entries), "points": len(all_points), "per_panorama": per_pano,
+              "colored": colored, "stride": stride, "max_depth": max_depth}
+    if out_path:
+        count = write_ply(out_path, all_points, colors=all_colors if colored else None,
+                          comments=comments, binary=binary)
+        result["points"] = count
+        result["path"] = out_path
+    return result

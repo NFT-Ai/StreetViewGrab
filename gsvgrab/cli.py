@@ -35,13 +35,14 @@ import time
 
 from . import __version__
 from .api import StreetViewApi
-from .depth import depth_to_float32, depth_to_gray16_mm, depth_to_rgb8
+from .crawl import Crawler
+from .depth import depth_to_float32, depth_to_gray16_mm, depth_to_rgb8, load_depth_f32
 from .geocode import GeocodeError, geocode
 from .geo import distance_m
 from .http import HttpClient
 from .parse import panorama_by_id_response
 from .pngio import write_png
-from .pointcloud import build_pointcloud
+from .pointcloud import build_pointcloud, merge_panoramas
 from .stitch import jpeg_backend, stitch_equirect
 
 
@@ -109,6 +110,10 @@ def build_parser():
     find.add_argument("--rings", type=int, default=1,
                       help="ile sąsiednich kafli pokrycia (domyślnie 1)")
     find.add_argument("--limit", type=int, default=20, help="ile pozycji wypisać")
+    find.add_argument("--with-metadata", action="store_true",
+                      help="dopisz adres i date zdjecia (1 zapytanie na pozycje)")
+    find.add_argument("--walk-count", type=int, default=5,
+                      help="ile panoram pokazac w trybie --walk (domyslnie 5)")
     find.add_argument("--walk", action="store_true",
                       help="pokaż też panoramy połączone (przejazd wzdłuż ulicy)")
 
@@ -137,6 +142,40 @@ def build_parser():
     grab.add_argument("--pointcloud-max-depth", type=float, default=None,
                       help="maksymalna głębia w chmurze punktów (metry)")
     grab.add_argument("--force", action="store_true", help="pozwól na bardzo duże obrazy")
+
+    walk = subparsers.add_parser("walk", help="przejdz ulice (krok w przód i z powrotem)")
+    add_target_arguments(walk)
+    add_common_arguments(walk)
+    walk.add_argument("--forward", type=int, default=10, help="krokow do przodu (domyslnie 10)")
+    walk.add_argument("--back", type=int, default=10, help="krokow z powrotem (domyslnie 10)")
+    walk.add_argument("--heading", type=float, default=None,
+                      help="kierunek marszu w stopniach (domyslnie naglowek startu)")
+    walk.add_argument("--stride", type=int, default=2, help="co ile pikseli w chmurze punktow")
+    walk.add_argument("--max-depth", type=float, default=None,
+                      help="maksymalna glebia w chmurze (metry; domyslnie bez limitu)")
+    walk.add_argument("--no-merge", action="store_true", help="nie sklejaj chmur punktow")
+    walk.add_argument("--route-only", action="store_true",
+                      help="tylko przejscie trasy, bez pobierania glebi")
+    walk.add_argument("--step-m", type=float, default=12.0,
+                      help="preferowana dlugosc kroku w metrach")
+
+    merge = subparsers.add_parser("merge", help="sklej chmury punktow z pobranego katalogu")
+    add_common_arguments(merge)
+    merge.add_argument("--in-dir", default=None,
+                       help="katalog pobrany komenda grab/walk (domyslnie: --out)")
+    merge.add_argument("--stride", type=int, default=2, help="co ile pikseli probkowac")
+    merge.add_argument("--max-depth", type=float, default=None, help="maksymalna glebia w metrach")
+    merge.add_argument("--out-file", default="chmura_sklejona.ply", help="nazwa pliku wynikowego")
+
+    mesh = subparsers.add_parser("mesh", help="wygeneruj siatke 3D (OBJ/PLY) z trasy lub panoram")
+    add_common_arguments(mesh)
+    mesh.add_argument("--in-dir", default=None,
+                      help="katalog pobrany komenda walk/grab (domyslnie: --out)")
+    mesh.add_argument("--stride", type=int, default=2, help="probkowanie siatki (co ile pikseli)")
+    mesh.add_argument("--max-depth", type=float, default=50.0, help="maksymalna glebia w metrach")
+    mesh.add_argument("--max-edge-ratio", type=float, default=0.18, help="prog rozrywania krawedzi")
+    mesh.add_argument("--out-obj", default=None, help="sciezka do wynikowego pliku .obj")
+    mesh.add_argument("--out-ply", default=None, help="sciezka do wynikowego pliku .ply")
 
     subparsers.add_parser("selftest", help="testy offline (bez sieci)")
     return parser
@@ -551,17 +590,17 @@ format w dowolnym momencie.
 
 
 def _print_pano_line(pano, distance):
-    """Wypisuje jedną linię z opisem panoramy."""
-    address = pano.get("address") or [{}]
-    label = "%s, %s" % (address[0].get("text", "?"), address[-1].get("text", "?"))
+    """Wypisuje jedną linię z opisem panoramy (dane z kafla pokrycia są niepełne)."""
+    address = pano.get("address") or []
+    label = ", ".join(item["text"] for item in address) if address else "-"
     date = pano.get("capture_date") or {}
+    captured = ("%s-%s" % (date["year"], date["month"])) if date.get("year") else "-"
     print("  %-8s %-10s %-7s %-24s %-10s %s"
           % ("%.1f m" % distance if distance else "-",
              (pano.get("panoid") or "?")[:10],
              ("%.1f" % pano["heading_deg"]) if pano.get("heading_deg") is not None else "-",
              "%.5f, %.5f" % (pano.get("lat") or 0.0, pano.get("lon") or 0.0),
-             "%s-%s" % (date.get("year", "?"), date.get("month", "?")),
-             label.replace("None", "?")))
+             captured, label))
 
 
 def cmd_find(args):
@@ -586,11 +625,23 @@ def cmd_find(args):
     print("  %-8s %-10s %-7s %-24s %-10s %s"
           % ("ODLEG.", "ID", "KIER.", "WSPOLRZEDNE", "ZDIEC", "ADRES"))
     for pano in panos[:args.limit]:
+        if getattr(args, "with_metadata", False):
+            try:
+                full = panorama_by_id_response(
+                    api.panorama_by_id(pano["panoid"], download_depth=False),
+                    include_depth=False)
+                if full:
+                    pano = dict(pano, address=full.get("address"),
+                                capture_date=full.get("capture_date"),
+                                elevation_m=full.get("elevation_m"))
+            except Exception:  # noqa: BLE001 - brak metadanych nie psuje listy
+                pass
         _print_pano_line(pano, pano["distance_m"])
     if len(panos) > args.limit:
         print("  ... i %d wiecej (uzyj --limit, aby zwiekszyc)" % (len(panos) - args.limit))
     if args.walk:
         print("\nTryb --walk: panorama startowa plus polaczone (przejazd wzdloz ulicy):")
+        args.max_panos = max(1, args.walk_count)
         for pano in collect_panos(args, api, target):
             print("  %-24s %8s m"
                   % (pano["panoid"], "%.1f" % (pano.get("distance_m") or 0.0)))
@@ -694,6 +745,184 @@ def cmd_grab(args):
     return 0
 
 
+def cmd_walk(args):
+    """Przechodzi ulica (kroki do przodu i z powrotem) i skleja chmury punktow."""
+    client = make_client(args)
+    api = StreetViewApi(client, locale=args.locale, api_key=args.api_key)
+    target = resolve_target(args, client, api)
+    if not target.get("panoid"):
+        target["panoid"] = _nearest_pano_for(api, target["lat"], target["lon"],
+                                             getattr(args, "radius", 800.0))[0]["panoid"]
+    os.makedirs(args.out, exist_ok=True)
+
+    crawler = Crawler(api, verbose=True, step_m=args.step_m)
+    print("\nPrzechodze od %s: %d krokow do przodu, %d z powrotem"
+          % (target["panoid"], args.forward, args.back))
+    route = crawler.traverse(target["panoid"], forward_steps=args.forward,
+                             back_steps=args.back, heading_deg=args.heading)
+    length = crawler.route_length(route)
+    extent = crawler.route_extent(route)
+    unique = []
+    seen = set()
+    for node in route:
+        if node["panoid"] not in seen:
+            seen.add(node["panoid"])
+            unique.append(node)
+
+    print()
+    print("  %-3s %-7s %-24s %-9s %-9s %-9s %s"
+          % ("#", "etap", "panoid", "odl.[m]", "kier.[d]", "hlad.[d]", "uwagi"))
+    for node in route:
+        notes = node["side"] + (" (powrotka)" if node.get("revisit") else "")
+        print("  %-3d %-7s %-24s %-9.1f %-9.1f %-9.1f %s"
+              % (node["step"], node["leg"], node["panoid"], node["distance_from_prev_m"],
+                 node["travel_heading_deg"], node["pano_heading_deg"] or 0.0, notes))
+    print("\n  wezlow: %d | unikalnych panoram: %d | dlugosc trasy: %.1f m"
+          % (len(route), len(unique), length))
+    print("  zasieg trasy: %.1f m (poludnie-poln) x %.1f m (wschod-zachod)"
+          % (extent.get("north_south_m", 0.0), extent.get("east_west_m", 0.0)))
+
+    write_json(os.path.join(args.out, "trasa.json"),
+               {"start_panoid": target["panoid"], "query": target.get("label"),
+                "lat": target.get("lat"), "lon": target.get("lon"),
+                "forward_steps": args.forward, "back_steps": args.back,
+                "length_m": length, "extent": extent, "route": route})
+    if args.route_only:
+        print("\nZapisano trase: %s" % os.path.join(args.out, "trasa.json"))
+        return 0
+
+    print("\nPobieram glebie dla %d unikalnych panoram..." % len(unique))
+    entries = []
+    for index, node in enumerate(unique, start=1):
+        panoid = node["panoid"]
+        print("  [%d/%d] %s" % (index, len(unique), panoid))
+        pano = panorama_by_id_response(api.panorama_by_id(panoid, download_depth=True),
+                                       include_depth=True)
+        if not pano:
+            print("      pominieto (brak metadanych)")
+            continue
+        depth = pano.pop("_depth", None)
+        pano_dir = os.path.join(args.out, "panoramy", panoid)
+        pano["route_step"] = node["step"]
+        pano["route_leg"] = node["leg"]
+        pano["downloaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        files = {}
+        if depth is not None:
+            depth_files, stats = save_depth_artifacts(depth, os.path.join(pano_dir, "depth"))
+            files.update(depth_files)
+            pano["depth_summary"] = {key: value for key, value in stats.items()
+                                     if key not in ("histogram", "planes")}
+            print("      glebia %dx%d, pokrycie %.1f%%, mediana %.2f m"
+                  % (depth.width, depth.height, stats["coverage_percent"],
+                     stats["percentiles_m"]["p50"]))
+            entries.append({"depth": depth, "panoid": panoid, "lat": pano.get("lat"),
+                            "lon": pano.get("lon"), "elevation_m": pano.get("elevation_m"),
+                            "heading_deg": pano.get("heading_deg")})
+        else:
+            print("      brak mapy glebi")
+        pano["files"] = {key: os.path.relpath(value, args.out) for key, value in files.items()}
+        write_json(os.path.join(pano_dir, "metadata.json"), pano)
+
+    if args.no_merge:
+        print("\nPominieto sklejanie chmur punktow (--no-merge).")
+        return 0
+    if not entries:
+        print("\nBrak danych glebi - nie ma czego sklejac.")
+        return 1
+
+    out_ply = os.path.join(args.out, "chmura_sklejona.ply")
+    comments = ["gsvgrab - sklejona chmura punktow: %s" % (target.get("label") or "?"),
+                "panoram: %d (kroki: %d do przodu + %d z powrotem)"
+                % (len(entries), args.forward, args.back),
+                "dlugosc trasy: %.1f m" % length,
+                "uklad ENU: X=wschod, Y=polnoc, Z=w gore; poczatek = kamera 1. panoramy",
+                "jednostki: metry"]
+    print("\nSklejam %d chmur punktow..." % len(entries))
+    result = merge_panoramas(entries, out_ply, stride=max(1, args.stride),
+                             max_depth=args.max_depth, comments=comments)
+    write_json(os.path.join(args.out, "chmura_sklejona.json"), result)
+    print("  punktow: %d | kolor: %s" % (result["points"],
+                                         "tak" if result["colored"] else "nie"))
+    xs = [item["east_m"] for item in result["per_panorama"]]
+    ys = [item["north_m"] for item in result["per_panorama"]]
+    print("  zasieg chmury: %.1f m (E-W) x %.1f m (N-S)"
+          % (max(xs) - min(xs), max(ys) - min(ys)))
+    print("  plik: %s" % out_ply)
+    print("Gotowe. Trasa: %s" % os.path.join(args.out, "trasa.json"))
+    return 0
+
+
+def cmd_merge(args):
+    """Scala chmury punktow zapisane w katalogu pobranym komenda grab/walk."""
+    client = make_client(args)
+    api = StreetViewApi(client, locale=args.locale, api_key=args.api_key)
+    in_dir = args.in_dir or args.out
+    panoramas_dir = os.path.join(in_dir, "panoramy")
+    if not os.path.isdir(panoramas_dir):
+        raise SystemExit("Nie znaleziono katalogu %s (uruchom najpierw grab lub walk)."
+                         % panoramas_dir)
+    entries = []
+    skipped = []
+    for panoid in sorted(os.listdir(panoramas_dir)):
+        pano_dir = os.path.join(panoramas_dir, panoid)
+        meta_path = os.path.join(pano_dir, "metadata.json")
+        if not os.path.exists(meta_path):
+            continue
+        with open(meta_path, encoding="utf-8") as handle:
+            meta = json.load(handle)
+        summary = meta.get("depth_summary") or {}
+        width, height = summary.get("width"), summary.get("height")
+        depth = None
+        if width and height:
+            try:
+                depth = load_depth_f32(os.path.join(pano_dir, "depth", "depth_f32.bin"),
+                                       width, height)
+            except Exception:  # noqa: BLE001 - w razie problemu pobieramy ponownie
+                depth = None
+        if depth is None:
+            pano = panorama_by_id_response(api.panorama_by_id(panoid, download_depth=True),
+                                           include_depth=True)
+            depth = (pano or {}).get("_depth")
+            if depth is None:
+                skipped.append(panoid)
+                continue
+        entries.append({"depth": depth, "panoid": panoid, "lat": meta.get("lat"),
+                        "lon": meta.get("lon"), "elevation_m": meta.get("elevation_m"),
+                        "heading_deg": meta.get("heading_deg")})
+    print("Znaleziono %d panoram z glebia w %s" % (len(entries), in_dir))
+    if skipped:
+        print("  pominieto (brak glebi): %s" % ", ".join(skipped))
+    if not entries:
+        raise SystemExit("Brak danych do scalenia.")
+    out_path = os.path.join(in_dir, args.out_file)
+    result = merge_panoramas(entries, out_path, stride=max(1, args.stride),
+                             max_depth=args.max_depth,
+                             comments=["gsvgrab - sklejona chmura punktow",
+                                       "zrodlo: %s" % in_dir,
+                                       "uklad ENU: X=wschod, Y=polnoc, Z=w gore"])
+    write_json(out_path.replace(".ply", ".json"), result)
+    xs = [item["east_m"] for item in result["per_panorama"]]
+    ys = [item["north_m"] for item in result["per_panorama"]]
+    print("Sklejono %d punktow z %d panoram" % (result["points"], result["panoramas"]))
+    print("  zasieg: %.1f m (E-W) x %.1f m (N-S)" % (max(xs) - min(xs), max(ys) - min(ys)))
+    print("  plik: %s" % out_path)
+    return 0
+
+
+def cmd_mesh(args):
+    """Generuje siatkę trójkątów 3D (OBJ i PLY) ze sklejonych panoram."""
+    from .mesh import build_route_mesh
+
+    in_dir = args.in_dir or args.out
+    if not os.path.isdir(in_dir):
+        raise SystemExit("Katalog %s nie istnieje." % in_dir)
+
+    build_route_mesh(in_dir, out_obj=args.out_obj, out_ply=args.out_ply,
+                     stride=max(1, args.stride), max_depth=args.max_depth,
+                     max_edge_ratio=args.max_edge_ratio)
+    return 0
+
+
 def main(argv=None):
     """Punkt wejścia CLI."""
     parser = build_parser()
@@ -704,6 +933,12 @@ def main(argv=None):
         return cmd_info(args)
     if args.command == "grab":
         return cmd_grab(args)
+    if args.command == "walk":
+        return cmd_walk(args)
+    if args.command == "merge":
+        return cmd_merge(args)
+    if args.command == "mesh":
+        return cmd_mesh(args)
     if args.command == "selftest":
         from .selftest import run_selftest
 
